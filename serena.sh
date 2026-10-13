@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup-serena.sh — install, configure, validate and maintain Serena for a project.
+# serena.sh — install, configure, validate and maintain Serena for a project.
 # https://github.com/oraios/serena
 set -euo pipefail
 
@@ -22,7 +22,7 @@ DO_INDEX=1; INDEX_SET=0
 DO_HEALTH=1; HEALTH_SET=0
 DO_PREPARE=0; PREPARE_SET=0
 DO_MEMORY_CHECK=0; MEMORY_SET=0
-DO_HOOKS=0; HOOKS_SET=0
+DO_HOOKS=0
 DO_SKILL=1
 SKILL_GLOBAL=0
 AUTO_APPROVE=0
@@ -43,11 +43,6 @@ REMOVE_TOOL=0
 REINDEX=0
 PROJECT_CREATED=0
 SCOPE_CHANGED=0
-READ_ONLY=0
-READ_ONLY_SET=0
-AGENT_INTERFACE=""
-DASHBOARD_OPEN=false  # Dashboard stays available; browser/tab will NOT auto-open.
-DASHBOARD_ENABLED=true
 CONFIG_PYTHON=""
 FAILED=()
 
@@ -88,7 +83,7 @@ The web dashboard remains enabled, but never automatically opens by default.
       --ignore PATTERN    Add a project ignored_paths glob (repeatable)
       --workspace PATH    Limit indexed monorepo folders (repeatable, replaces ".");
                           folders must not match ignore rules
-      --interface NAME    tools or repl (project-level agent interface)
+      --interface NAME    tools or repl (selected configuration scope)
       --read-only         Set project read_only: true (not a security sandbox)
       --profile NAME      minimal, standard (default), or advanced
       --prepare-lsp      Prefetch managed dependencies of detected/selected LSPs
@@ -113,7 +108,37 @@ The web dashboard remains enabled, but never automatically opens by default.
       --remove-tool      With --uninstall: also uninstall the serena-agent uv
                          tool (global; affects all projects)
   -y, --yes               Confirm optional uv installation without prompting
-      --dry-run           Show intended steps without writing or prompting
+      --config PATH       Load an additional TOML file (repeatable)
+      --no-config         Skip automatic user/project TOML files
+      --preset NAME       Apply a named preset before CLI overrides
+      --show-config       Print resolved configuration and sources; exit
+      --scope NAME        project (default) or global for persistent settings
+      --default-mode NAME Replace persistent defaults (repeatable)
+      --add-mode NAME     Set persistent added_modes (repeatable)
+      --base-mode NAME    Set always-active modes (--scope global only)
+      --mode NAME         Replace startup default modes (repeatable)
+      --startup-add-mode NAME  Add a startup mode (repeatable)
+      --context NAME      Override client startup context
+      --list-modes        List installed modes; exit
+      --list-contexts     List installed contexts; exit
+      --backend NAME      LSP or JetBrains, at the selected scope
+      --read-write        Set project read_only: false
+      --exclude-tool NAME / --include-tool NAME  Persistent tool lists
+      --exclude-api NAME / --include-api NAME    Persistent REPL API lists
+      --initial-prompt-file PATH  Load a project prompt from a text file
+      --set KEY=JSON      Set a typed persistent setting at selected scope
+      --clear KEY         Explicitly empty a persistent list
+      --inherit KEY       Restore a native project default / inheritance
+      --tool-timeout N    Positive startup timeout in seconds
+      --log-level LEVEL   DEBUG, INFO, WARNING, ERROR, or CRITICAL
+      --no-open-dashboard Keep dashboard available without browser auto-open
+      --dashboard        Enable dashboard (startup)
+      --gui-log-window / --no-gui-log-window  Control startup log viewer
+      --trace-lsp / --no-trace-lsp  Control startup LSP tracing
+      --no-hooks / --no-auto-approve / --skill / --skill-local
+      --index / --detect / --no-check-memories / --user-registration
+                          Override saved bootstrap preferences
+      --dry-run           Show configuration diffs and commands without writes
   -h, --help              Show this message
 
 Profiles: minimal = no index or health check; standard = index and health check;
@@ -133,6 +158,39 @@ Examples:
 EOF
 }
 
+# Resolve the symlink so ~/scripts/serena.sh can find its companion helper.
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+  SCRIPT_LINK="$(readlink "$SCRIPT_PATH")"
+  if [[ "$SCRIPT_LINK" == /* ]]; then SCRIPT_PATH="$SCRIPT_LINK"
+  else SCRIPT_PATH="$(dirname "$SCRIPT_PATH")/$SCRIPT_LINK"; fi
+done
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd -P)"
+CONFIG_HELPER="$SCRIPT_DIR/bootstrap_config.py"
+# Help remains available without Python or an installed Serena.
+for arg in "$@"; do
+  [[ "$arg" == -- ]] && break
+  case "$arg" in -h|--help) usage; exit 0 ;; esac
+done
+have python3 || die "Python 3.11+ is required to resolve bootstrap configuration"
+python3 -c 'import tomllib' 2>/dev/null || die "Python 3.11+ is required (tomllib)"
+[[ -f "$CONFIG_HELPER" ]] || die "Missing companion helper: $CONFIG_HELPER (keep the repository together)"
+CONFIG_STATE="$(python3 "$CONFIG_HELPER" resolve "$@")" || exit 1
+RESOLVED_ARGS=()
+while IFS= read -r -d '' arg; do RESOLVED_ARGS+=("$arg"); done < <(python3 "$CONFIG_HELPER" args "$CONFIG_STATE")
+set -- "${RESOLVED_ARGS[@]}"
+if python3 "$CONFIG_HELPER" action "$CONFIG_STATE" show_config; then
+  python3 "$CONFIG_HELPER" show "$CONFIG_STATE"
+  exit 0
+fi
+for action in list_modes list_contexts; do
+  if python3 "$CONFIG_HELPER" action "$CONFIG_STATE" "$action"; then
+    have serena || die "Install Serena before listing modes/contexts"
+    if [[ "$action" == list_modes ]]; then serena mode list; else serena context list; fi
+    exit 0
+  fi
+done
+
 while (( $# )); do
   case "$1" in
     -c|--client)
@@ -145,31 +203,26 @@ while (( $# )); do
     -n|--name) [[ $# -ge 2 && "$2" != -* ]] || die "$1 requires a name"; PROJECT_NAME="$2"; shift 2 ;;
     --ignore) [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a pattern"; IGNORE_PATTERNS+=("$2"); shift 2 ;;
     --workspace) [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a path"; WORKSPACE_FOLDERS+=("$2"); shift 2 ;;
-    --interface)
-      [[ $# -ge 2 ]] || die "$1 requires tools or repl"
-      case "${2,,}" in tools) AGENT_INTERFACE=tools ;; repl) AGENT_INTERFACE=REPL ;; *) die "Unknown interface: $2" ;; esac
-      shift 2 ;;
     --profile) [[ $# -ge 2 ]] || die "$1 requires a profile"; PROFILE="$2"; shift 2 ;;
-    --read-only) READ_ONLY=1; READ_ONLY_SET=1; shift ;;
     --no-detect) DETECT=0; shift ;;
     --sync-languages) SYNC_LANGUAGES=1; shift ;;
     --min-files) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ ]] || die "$1 requires an integer"; MIN_FILES="$2"; shift 2 ;;
     --max-languages) [[ $# -ge 2 && "$2" =~ ^[0-9]+$ && "$2" -gt 0 ]] || die "$1 requires a positive integer"; MAX_LANGUAGES="$2"; shift 2 ;;
+    --index) DO_INDEX=1; INDEX_SET=1; shift ;;
     --no-index) DO_INDEX=0; INDEX_SET=1; shift ;;
     --reindex) REINDEX=1; DO_INDEX=1; INDEX_SET=1; shift ;;
     --health-check) DO_HEALTH=1; HEALTH_SET=1; shift ;;
     --no-health-check) DO_HEALTH=0; HEALTH_SET=1; shift ;;
     --prepare-lsp) DO_PREPARE=1; PREPARE_SET=1; shift ;;
     --no-prepare-lsp) DO_PREPARE=0; PREPARE_SET=1; shift ;;
+    --no-check-memories) DO_MEMORY_CHECK=0; MEMORY_SET=1; shift ;;
     --check-memories) DO_MEMORY_CHECK=1; MEMORY_SET=1; shift ;;
     --per-project) PER_PROJECT=1; shift ;;
-    --hooks) DO_HOOKS=1; HOOKS_SET=1; shift ;;
-    --auto-approve) AUTO_APPROVE=1; DO_HOOKS=1; HOOKS_SET=1; shift ;;
+    --hooks) DO_HOOKS=1; shift ;;
+    --auto-approve) AUTO_APPROVE=1; DO_HOOKS=1; shift ;;
     --no-skill) DO_SKILL=0; shift ;;
     --skill-global) SKILL_GLOBAL=1; shift ;;
     --jetbrains) JETBRAINS=1; shift ;;
-    --open-dashboard) DASHBOARD_OPEN=true; shift ;;
-    --no-dashboard) DASHBOARD_ENABLED=false; DASHBOARD_OPEN=false; shift ;;
     --upgrade) UPGRADE=1; shift ;;
     --doctor) DOCTOR_ONLY=1; shift ;;
     --uninstall) UNINSTALL=1; shift ;;
@@ -214,9 +267,6 @@ if (( UNINSTALL )) && (( ! CLIENTS_SET )); then
   # Every removal step is idempotent and reports "already absent",
   # so default to all known clients; pass -c to narrow the scope.
   CLIENTS=(claude-code codex grok codebuddy opencode pi)
-fi
-if (( READ_ONLY )) && [[ "$AGENT_INTERFACE" == REPL ]]; then
-  warn "Serena REPL executes arbitrary Python; --read-only is NOT an enforcement boundary."
 fi
 
 ensure_uv() {
@@ -292,168 +342,57 @@ choose_python() {
   [[ -n "$CONFIG_PYTHON" ]] || die "Python 3 is required for safe YAML/JSON config merges"
 }
 
-# Small, dependency-free, conservative YAML config editor for Serena's known
-# top-level scalars and simple lists. Supports flow and block lists and legacy
-# 'languages'. Refuses unsupported YAML instead of corrupting it.
-# Invoked only on explicitly requested changes, after 'serena init/create'.
+# Reuse Serena's own environment and round-trip YAML dependency.
+choose_yaml_python() {
+  local executable candidate
+  if ! have serena && (( DRY_RUN )); then
+    YAML_PYTHON=""
+    warn "Serena is not installed; showing intended changes without YAML diffs or installed-version validation"
+    return 0
+  fi
+  executable="$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$(command -v serena)")"
+  candidate="$(dirname "$executable")/python"
+  if [[ -x "$candidate" ]] && "$candidate" -c 'import ruamel.yaml, serena, tomllib' 2>/dev/null; then
+    YAML_PYTHON="$candidate"
+  elif python3 -c 'import ruamel.yaml, serena, tomllib' 2>/dev/null; then
+    YAML_PYTHON="$(command -v python3)"
+  else
+    die "Serena's Python environment must provide ruamel.yaml and Python 3.11+"
+  fi
+}
+
 edit_yaml() {
   local op="$1" file="$2"; shift 2
-  if (( DRY_RUN )); then printf '    [dry-run] %s %s:' "$op" "$file"; printf ' %q' "$@"; printf '\n'; return 0; fi
-  choose_python
-  "$CONFIG_PYTHON" - "$op" "$file" "$@" <<'PY'
-import csv, json, os, pathlib, re, shutil, sys, tempfile, time
-op, filename, *args = sys.argv[1:]
-path = pathlib.Path(filename)
-if not path.is_file():
-    raise SystemExit(f"Config not found: {path}")
-original = path.read_text(encoding="utf-8")
-lines = original.splitlines(keepends=True)
+  if (( DRY_RUN )) && [[ -z "$YAML_PYTHON" ]]; then
+    printf '    [dry-run] %s %s:' "$op" "$file"; printf ' %q' "$@"; printf '\n'
+    return 0
+  fi
+  local args=(edit-yaml "$op" "$file")
+  (( DRY_RUN )) && args+=(--dry-run)
+  "$YAML_PYTHON" "$CONFIG_HELPER" "${args[@]}" -- "$@"
+}
 
-def locate(key):
-    for i, line in enumerate(lines):
-        m = re.match(rf"^{re.escape(key)}\s*:(.*)$", line)
-        if m:
-            j = i + 1
-            while j < len(lines):
-                s = lines[j]
-                if re.match(r"^[A-Za-z_][A-Za-z0-9_-]*\s*:", s):
-                    break
-                j += 1
-            return i, j, m.group(1).strip()
-    return None
+validate_configuration() {
+  local help_text
+  choose_yaml_python
+  [[ -z "$YAML_PYTHON" ]] && return 0
+  help_text="$(mktemp)"
+  serena start-mcp-server --help > "$help_text" || { rm -f "$help_text"; return 1; }
+  local status=0
+  "$YAML_PYTHON" "$CONFIG_HELPER" validate "$CONFIG_STATE" "$help_text" || status=$?
+  rm -f "$help_text"
+  return "$status"
+}
 
-def read_list(key):
-    loc = locate(key)
-    if loc is None:
-        return []
-    i, j, value = loc
-    # Inline comments after a flow list aren't supported, to avoid rewriting
-    # complex YAML or accidentally eating a '#'-containing pattern.
-    if value and value != 'null' and value != '~':
-        if not (value.startswith('[') and value.endswith(']')):
-            raise ValueError(f"{key} must be a block or inline list: {value!r}")
-        content = value[1:-1].strip()
-        if not content:
-            return []
-        try:
-            v = json.loads(value)
-            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
-                raise ValueError("not a string list")
-            return v
-        except (ValueError, TypeError):
-            # Also accept valid YAML lists of bare identifiers and single quotes.
-            parts = next(csv.reader([content], skipinitialspace=True))
-            if not all(re.fullmatch(r"(?:[A-Za-z][A-Za-z0-9_.+-]*|'[^']*'|\"[^\"]*\")", s.strip()) for s in parts):
-                raise ValueError(f"Unsupported inline YAML syntax in {key}")
-            return [s.strip().strip("'\"") for s in parts]
-    found = []
-    for line in lines[i+1:j]:
-        if not line.strip() or line.lstrip().startswith('#'):
-            continue
-        m = re.match(r'^\s*-\s+(.*?)\s*(?:#.*)?$', line.rstrip('\n'))
-        if not m:
-            raise ValueError(f"Unsupported block YAML syntax in {key}: {line.strip()}")
-        value = m.group(1).strip()
-        if value[:1] in "'\"" and value[-1:] == value[:1]:
-            value = value[1:-1]
-        found.append(value)
-    return found
-
-def set_scalar(key, value):
-    loc = locate(key)
-    newline = f'{key}: {value}\n'
-    if loc is None:
-        if lines and not lines[-1].endswith('\n'): lines[-1] += '\n'
-        lines.append(newline)
-    else:
-        i, _j, _old = loc
-        # Preserve trailing comments for top-level scalar keys.
-        suffix = ''
-        if ' #' in lines[i]: suffix = ' #' + lines[i].split(' #', 1)[1].rstrip('\n')
-        lines[i] = f'{key}: {value}{suffix}\n'
-
-def set_list(key, additions):
-    current = read_list(key)
-    merged = list(dict.fromkeys(current + additions))
-    if merged == current and len(current) == len(set(current)): return
-    loc = locate(key)
-    if loc is None:
-        if lines and not lines[-1].endswith('\n'): lines[-1] += '\n'
-        lines.append(f'{key}:\n')
-        lines.extend(f'- {json.dumps(x, ensure_ascii=False)}\n' for x in merged)
-        return
-    i, j, value = loc
-    if len(current) != len(set(current)):
-        # Repair duplicate entries without leaving an ambiguous list behind.
-        lines[i:j] = [f'{key}:\n'] + [f'- {json.dumps(x, ensure_ascii=False)}\n' for x in merged]
-    elif value.startswith('[') or value in ('', 'null', '~'):
-        # Flow list or null/empty list: rewrite the scalar before adding items.
-        lines[i] = f'{key}:\n'
-        lines[i+1:i+1] = [f'- {json.dumps(x, ensure_ascii=False)}\n' for x in merged]
-    else:
-        indent = ''
-        for line in lines[i+1:j]:
-            m = re.match(r'^(\s*)-\s+', line)
-            if m: indent = m.group(1); break
-        # Insert after last existing item, before the next YAML section.
-        insertion = i + 1
-        for k in range(i+1, j):
-            if re.match(r'^\s*-\s+', lines[k]): insertion = k + 1
-        lines[insertion:insertion] = [f'{indent}- {json.dumps(x, ensure_ascii=False)}\n' for x in merged[len(current):]]
-
-try:
-    if op == 'scalar':
-        key, value = args
-        set_scalar(key, value)
-    elif op == 'list':
-        key, *items = args
-        set_list(key, items)
-    elif op == 'replace-list':
-        key, *items = args
-        merged = list(dict.fromkeys(items))
-        loc = locate(key)
-        replacement = [f'{key}:\n'] + [f'- {json.dumps(x, ensure_ascii=False)}\n' for x in merged]
-        if loc is None:
-            if lines and not lines[-1].endswith('\n'): lines[-1] += '\n'
-            lines.extend(replacement)
-        else:
-            i, j, _ = loc
-            # Keep comments attached to the existing section.
-            comments = [line for line in lines[i+1:j] if line.lstrip().startswith('#')]
-            lines[i:j] = replacement + comments
-    elif op == 'languages':
-        # Rename legacy key and merge values if both keys are present.
-        old = read_list('languages')
-        wanted = list(dict.fromkeys(old + args))
-        legacy = locate('languages')
-        if legacy:
-            i, j, _ = legacy
-            # Preserve unrelated comments in the legacy section.
-            comments = [s for s in lines[i+1:j] if s.lstrip().startswith('#')]
-            lines[i:j] = comments
-        set_list('language_servers', wanted)
-    else:
-        raise ValueError(f"Unknown edit operation: {op}")
-except (ValueError, IndexError) as exc:
-    raise SystemExit(f"Refusing unsafe YAML edit in {path}: {exc}")
-updated = ''.join(lines)
-if updated == original:
-    print(f"Unchanged: {path}")
-    sys.exit(0)
-backup = path.with_name(path.name + '.bak.' + time.strftime('%Y%m%d-%H%M%S') + f'.{time.time_ns() % 1000000000:09d}')
-shutil.copy2(path, backup)
-fd, tmp = tempfile.mkstemp(prefix=path.name+'.', dir=path.parent)
-try:
-    with os.fdopen(fd, 'w', encoding='utf-8', newline='\n') as out:
-        out.write(updated)
-        out.flush(); os.fsync(out.fileno())
-    shutil.copymode(path, tmp)
-    os.replace(tmp, path)
-except BaseException:
-    if os.path.exists(tmp): os.unlink(tmp)
-    raise
-print(f"Updated: {path} (backup: {backup})")
-PY
+apply_configuration() {
+  if [[ -z "$YAML_PYTHON" ]]; then
+    python3 "$CONFIG_HELPER" preview "$CONFIG_STATE"
+    return 0
+  fi
+  if "$YAML_PYTHON" "$CONFIG_HELPER" scope-changed "$CONFIG_STATE"; then SCOPE_CHANGED=1; fi
+  local args=(apply "$CONFIG_STATE" "$SERENA_CONFIG")
+  (( DRY_RUN )) && args+=(--dry-run)
+  "$YAML_PYTHON" "$CONFIG_HELPER" "${args[@]}"
 }
 
 edit_scope_yaml() {
@@ -464,18 +403,6 @@ edit_scope_yaml() {
   return 0
 }
 
-config_dashboard() {
-  local file="$SERENA_CONFIG"
-  log "Dashboard: enabled=$DASHBOARD_ENABLED, open_on_launch=$DASHBOARD_OPEN (global config)"
-  if (( DRY_RUN )); then
-    edit_yaml scalar "$file" web_dashboard "$DASHBOARD_ENABLED"
-    edit_yaml scalar "$file" web_dashboard_open_on_launch "$DASHBOARD_OPEN"
-    return 0
-  fi
-  [[ -f "$file" ]] || { warn "Global Serena config not found: $file"; return 1; }
-  edit_yaml scalar "$file" web_dashboard "$DASHBOARD_ENABLED" || return 1
-  edit_yaml scalar "$file" web_dashboard_open_on_launch "$DASHBOARD_OPEN"
-}
 
 # Source-file detection uses 'git ls-files' when available to ignore generated
 # files. Data/markup LSPs require explicit --language.
@@ -586,35 +513,18 @@ create_project() {
   if (( ${#valid_workspaces[@]} )); then
     edit_scope_yaml replace-list "$file" ls_workspace_folders "${valid_workspaces[@]}" || return 1
   fi
-  if (( JETBRAINS )); then edit_yaml scalar "$file" language_backend JetBrains || return 1; fi
-  if [[ -n "$AGENT_INTERFACE" ]]; then edit_yaml scalar "$file" agent_interface "$AGENT_INTERFACE" || return 1; fi
-  if (( READ_ONLY_SET )); then edit_yaml scalar "$file" read_only true || return 1; fi
 }
 
 # Honor the effective backend even when it was configured before this setup
 # invocation (project settings override the global setting). Do not run the LSP
 # index or health-check against a JetBrains-backed project.
 detect_effective_backend() {
-  choose_python
   local backend
-  backend="$("$CONFIG_PYTHON" - "$PROJECT_CONFIG" "$SERENA_CONFIG" <<'PY'
-import pathlib, re, sys
-
-def read_backend(filename):
-    path = pathlib.Path(filename)
-    if not path.exists():
-        return None
-    # Only recognize a simple top-level scalar; unknown syntax is left for
-    # Serena's own config parser to validate during subsequent commands.
-    for line in path.read_text(encoding='utf-8').splitlines():
-        m = re.match(r"^language_backend:\s*['\"]?(LSP|JetBrains)['\"]?\s*(?:#.*)?$", line, re.I)
-        if m:
-            return m.group(1)
-    return None
-
-print(read_backend(sys.argv[1]) or read_backend(sys.argv[2]) or 'LSP')
-PY
-)" || return 1
+  if [[ -n "$YAML_PYTHON" ]]; then
+    backend="$("$YAML_PYTHON" "$CONFIG_HELPER" backend "$CONFIG_STATE" "$SERENA_CONFIG")" || return 1
+  else
+    backend="$(python3 "$CONFIG_HELPER" backend-requested "$CONFIG_STATE")"
+  fi
   EFFECTIVE_JETBRAINS=0
   if [[ "${backend,,}" == jetbrains ]]; then
     EFFECTIVE_JETBRAINS=1
@@ -674,8 +584,10 @@ check_memories() {
 # Ensure explicit MCP registrations NEVER auto-open unless opted in.
 server_args() {
   local context="$1"; shift
-  MCP_SERVER_ARGS=(start-mcp-server --context "$context" --open-web-dashboard "$DASHBOARD_OPEN")
-  [[ -n "$AGENT_INTERFACE" ]] && MCP_SERVER_ARGS+=(--agent-interface "$AGENT_INTERFACE")
+  context="$(python3 "$CONFIG_HELPER" context "$CONFIG_STATE" "$context")"
+  MCP_SERVER_ARGS=(start-mcp-server --context "$context")
+  local arg
+  while IFS= read -r -d '' arg; do MCP_SERVER_ARGS+=("$arg"); done < <(python3 "$CONFIG_HELPER" server-args "$CONFIG_STATE")
   MCP_SERVER_ARGS+=("$@")
 }
 
@@ -703,40 +615,46 @@ PY
 }
 
 setup_client() {
-  local client="$1"
+  local client="$1" context="$1" client_bin
   log "Configuring MCP client: $client"
-  case "$client" in
-    claude-code)
-      if (( PER_PROJECT )); then
-        if (( ! DRY_RUN )) && ! have claude; then warn "Claude CLI missing"; return 1; fi
-        server_args claude-code --project "$PROJECT_DIR"
-        if (( ! DRY_RUN )); then
-          local status=0
-          claude_project_registration_status || status=$?
-          case "$status" in
-            0) ok "Claude project MCP registration already matches"; return 0 ;;
-            1) : ;;
-            2) warn "Replacing outdated project-scoped Serena MCP registration"
-               (cd "$PROJECT_DIR" && claude mcp remove --scope project serena) || return 1 ;;
-            *) warn "Could not inspect $PROJECT_DIR/.mcp.json; refusing to overwrite"; return 1 ;;
-          esac
-        fi
-        (cd "$PROJECT_DIR" && run claude mcp add --scope project serena -- "$SERENA_BIN" "${MCP_SERVER_ARGS[@]}")
-      else
-        # Serena native setup registers its own command. Global dashboard
-        # configuration above controls whether it opens on startup.
-        run serena setup claude-code
-      fi ;;
-    codex|grok|codebuddy)
-      run serena setup "$client" ;;
-    opencode|pi)
-      if (( ! DRY_RUN )) && ! have "$client"; then warn "$client CLI missing"; return 1; fi
-      server_args agent --project "$PROJECT_DIR"
-      local args=(mcp add serena)
-      [[ "$client" == pi ]] && args+=(--local)
-      (cd "$PROJECT_DIR" && run "$client" "${args[@]}" -- "$SERENA_BIN" "${MCP_SERVER_ARGS[@]}") ;;
-    *) warn "Unsupported client: $client"; return 1 ;;
-  esac
+  case "$client" in claude-code) client_bin=claude ;; *) client_bin="$client" ;; esac
+  if (( ! DRY_RUN )) && ! have "$client_bin"; then warn "$client_bin CLI missing"; return 1; fi
+  case "$client" in opencode|pi) context=agent ;; esac
+  if [[ "$client" == claude-code ]] && (( PER_PROJECT )); then
+    server_args "$context" --project "$PROJECT_DIR"
+    local status=0
+    if (( ! DRY_RUN )); then
+      claude_project_registration_status || status=$?
+      case "$status" in
+        0) ok "Claude project MCP registration already matches"; return 0 ;;
+        1) : ;;
+        2) (cd "$PROJECT_DIR" && claude mcp remove --scope project serena) || return 1 ;;
+        *) warn "Could not inspect $PROJECT_DIR/.mcp.json; refusing to overwrite"; return 1 ;;
+      esac
+    fi
+    (cd "$PROJECT_DIR" && run claude mcp add --scope project serena -- "$SERENA_BIN" "${MCP_SERVER_ARGS[@]}")
+  else
+    case "$client" in
+      opencode|pi) server_args "$context" --project "$PROJECT_DIR" ;;
+      *) server_args "$context" --project-from-cwd ;;
+    esac
+    # Claude rejects duplicate names: check only its user-scope entry before replacing.
+    if [[ "$client" == claude-code ]] && (( ! DRY_RUN )); then
+      local status=0
+      python3 "$CONFIG_HELPER" claude-user-status "$HOME/.claude.json" "$SERENA_BIN" "${MCP_SERVER_ARGS[@]}" || status=$?
+      case "$status" in
+        0) ok "Claude user MCP registration already matches"; return 0 ;;
+        1) : ;;
+        2) (cd "$PROJECT_DIR" && claude mcp remove --scope user serena) || return 1 ;;
+        *) warn "Cannot inspect Claude user configuration; refusing to overwrite"; return 1 ;;
+      esac
+    fi
+    local args=(mcp add)
+    case "$client" in claude-code|grok|codebuddy) args+=(--scope user) ;; esac
+    args+=(serena)
+    [[ "$client" == pi ]] && args+=(--local)
+    (cd "$PROJECT_DIR" && run "$client_bin" "${args[@]}" -- "$SERENA_BIN" "${MCP_SERVER_ARGS[@]}")
+  fi
 }
 
 # Install hooks per client, preserving non-Serena hooks and filling in only
@@ -1265,10 +1183,19 @@ main() {
   log "Project directory: $PROJECT_DIR"
   ensure_uv
   install_serena
+  # Installed-version validation happens before configuration writes.
+  validate_configuration || die "Configuration validation failed"
   init_serena || die "Serena initialization failed"
-  config_dashboard || FAILED+=("dashboard-config")
+  local requested_backend
+  if [[ -n "$YAML_PYTHON" ]]; then
+    requested_backend="$("$YAML_PYTHON" "$CONFIG_HELPER" backend "$CONFIG_STATE" "$SERENA_CONFIG")" || die "Cannot inspect language backend"
+  else
+    requested_backend="$(python3 "$CONFIG_HELPER" backend-requested "$CONFIG_STATE")"
+  fi
+  [[ "$requested_backend" == JetBrains ]] && JETBRAINS=1
   resolve_languages
   if create_project; then
+    apply_configuration || die "Could not apply explicit configuration"
     detect_effective_backend || FAILED+=("backend-detection")
     if (( ! EFFECTIVE_JETBRAINS )); then
       prepare_ls_dependencies || FAILED+=("lsp-prefetch")
@@ -1310,7 +1237,7 @@ EOF
     printf '  - To onboard with an agent, rerun setup with --client NAME.\n'
   fi
   cat <<EOF
-  - The dashboard will $( [[ "$DASHBOARD_ENABLED" == false ]] && printf 'be disabled' || { [[ "$DASHBOARD_OPEN" == true ]] && printf 'auto-open' || printf 'remain available without opening a browser tab'; } ).
+  - The dashboard defaults to remaining available without opening a browser; inspect --show-config for overrides.
   - Global settings: ${SERENA_HOME:-$HOME/.serena}/serena_config.yml
   - Project settings: $PROJECT_DIR/.serena/project.yml
   - Serena agent skill: $SERENA_SKILL_REPO (skill: $SERENA_SKILL_NAME)
